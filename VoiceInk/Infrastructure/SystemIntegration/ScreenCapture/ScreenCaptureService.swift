@@ -4,6 +4,12 @@ import Foundation
 import ScreenCaptureKit
 import Vision
 
+// Private but canonical AX SPI used across the industry (Rectangle, Loop, etc.) to
+// resolve the CGWindowID behind an AXUIElement. Provides a stable identity to match
+// an AX-focused window against SCWindow.windowID, sidestepping frame/title ambiguity.
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
+
 @MainActor
 class ScreenCaptureService: ObservableObject {
     @Published var isCapturing = false
@@ -13,6 +19,7 @@ class ScreenCaptureService: ObservableObject {
         let processID: pid_t
         let title: String?
         let frame: CGRect?
+        let windowID: CGWindowID?
     }
 
     private static let captureTimeout: TimeInterval = 3.0
@@ -74,6 +81,7 @@ class ScreenCaptureService: ObservableObject {
 
         var focusedTitle: String?
         var focusedFrame: CGRect?
+        var focusedWindowID: CGWindowID?
 
         if AXIsProcessTrusted() {
             let appElement = AXUIElementCreateApplication(frontmostPID)
@@ -85,13 +93,19 @@ class ScreenCaptureService: ObservableObject {
                 {
                     focusedFrame = CGRect(origin: position, size: size)
                 }
+
+                var windowID: CGWindowID = 0
+                if _AXUIElementGetWindow(focusedWindow, &windowID) == .success, windowID != 0 {
+                    focusedWindowID = windowID
+                }
             }
         }
 
         return FocusedWindowHint(
             processID: frontmostPID,
             title: focusedTitle,
-            frame: focusedFrame
+            frame: focusedFrame,
+            windowID: focusedWindowID
         )
     }
 
@@ -169,6 +183,17 @@ class ScreenCaptureService: ObservableObject {
 
         guard !appWindows.isEmpty else {
             return candidates.first
+        }
+
+        // Unique identity match: when the AX SPI resolved a CGWindowID, prefer the
+        // SCWindow with the exact same id. This is the only reliable disambiguator
+        // when an app (e.g. Warp) has many windows sharing an identical frame and
+        // title. Falls through to frame/title/first when the id is absent or the SPI
+        // returns something not present in SCShareableContent (private API can vary).
+        if let focusedWindowID = focusedWindowHint.windowID,
+            let identifiedWindow = appWindows.first(where: { $0.windowID == focusedWindowID })
+        {
+            return identifiedWindow
         }
 
         if let focusedFrame = focusedWindowHint.frame,
