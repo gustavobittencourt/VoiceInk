@@ -5,6 +5,44 @@ import CoreAudio
 import Foundation
 import os
 
+/// One render buffer handed to AudioConverterFillComplexBuffer. `consumed` flips
+/// once the converter has taken it, so the input proc reports "no more data"
+/// instead of feeding the same block twice.
+private struct ConverterInputPayload {
+    var samples: UnsafeMutablePointer<Float32>?
+    var frameCount: UInt32
+    var consumed: Bool
+}
+
+private let converterInputProc: AudioConverterComplexInputDataProc = {
+    (_, ioNumberDataPackets, ioData, _, inUserData) -> OSStatus in
+
+    guard let inUserData else {
+        ioNumberDataPackets.pointee = 0
+        return noErr
+    }
+
+    let payload = inUserData.assumingMemoryBound(to: ConverterInputPayload.self)
+
+    guard !payload.pointee.consumed,
+        let samples = payload.pointee.samples,
+        payload.pointee.frameCount > 0
+    else {
+        ioNumberDataPackets.pointee = 0
+        return noErr
+    }
+
+    let frames = payload.pointee.frameCount
+    ioData.pointee.mNumberBuffers = 1
+    ioData.pointee.mBuffers.mNumberChannels = 1
+    ioData.pointee.mBuffers.mDataByteSize = frames * UInt32(MemoryLayout<Float32>.size)
+    ioData.pointee.mBuffers.mData = UnsafeMutableRawPointer(samples)
+    ioNumberDataPackets.pointee = frames
+    payload.pointee.consumed = true
+
+    return noErr
+}
+
 // MARK: - Core Audio Recorder (AUHAL-based, does not change system default device)
 final class CoreAudioRecorder: @unchecked Sendable {
     private final class InputBufferSlot: @unchecked Sendable {
@@ -47,6 +85,18 @@ final class CoreAudioRecorder: @unchecked Sendable {
     private var conversionBuffer: UnsafeMutablePointer<Int16>?
     private var conversionBufferSize: UInt32 = 0
 
+    // Mono downmix staging buffer, used only on audioProcessingQueue.
+    private var monoBuffer: UnsafeMutablePointer<Float32>?
+    private var monoBufferSize: UInt32 = 0
+
+    // Sample rate conversion is delegated to Core Audio so the anti-aliasing
+    // filter state carries across render buffers. Doing it by hand per buffer
+    // resets the filter phase every block, which modulates the signal (spurs at
+    // the block rate) and drops the frames that don't fit a whole output frame.
+    private var converter: AudioConverterRef?
+    private var converterInputSampleRate: Double = 0
+    private var converterInputChannels: UInt32 = 0
+
     // Audio metering. Store bit patterns so the render callback never locks.
     private let averagePowerBits = ManagedAtomic<UInt32>(Float32(-160.0).bitPattern)
     private let peakPowerBits = ManagedAtomic<UInt32>(Float32(-160.0).bitPattern)
@@ -68,6 +118,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
         label: "com.prakashjoshipax.voiceink.audioProcessing", qos: .userInitiated)
     private let audioProcessingQueueKey = DispatchSpecificKey<Void>()
     private let maxFramesPerRender: UInt32 = 4096
+    private let converterOutputSlack: UInt32 = 16
     private let inputRingSlotCount = 96
     private var inputBufferSlots: [InputBufferSlot] = []
     private var inputBufferCapacitySamples: UInt32 = 0
@@ -169,6 +220,12 @@ final class CoreAudioRecorder: @unchecked Sendable {
             try createOutputFile(at: url)
             resetAudioProcessingState()
 
+            // The AUHAL setup (and its converter) is reused across recordings —
+            // clear any filter state left over from the previous one.
+            if let converter {
+                AudioConverterReset(converter)
+            }
+
             try startAudioUnit()
         } catch {
             isRecording = false
@@ -205,6 +262,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
         }
 
         drainAudioProcessingQueue()
+        flushConverterTail()
         logDroppedInputBufferCounters(context: "stop")
 
         let shouldInvalidatePreparation = capturedTooLittleAudio()
@@ -596,16 +654,101 @@ final class CoreAudioRecorder: @unchecked Sendable {
             inputBufferCapacitySamples = bufferSamples
         }
 
-        let maxOutputFrames = UInt32(ceil(Double(maxFrames) * (outputFormat.mSampleRate / inputSampleRate))) + 1
+        if maxFrames > monoBufferSize {
+            monoBuffer?.deallocate()
+            monoBuffer = UnsafeMutablePointer<Float32>.allocate(capacity: Int(maxFrames))
+            monoBufferSize = maxFrames
+        }
+
+        // Extra headroom: the converter's output per call is not exactly
+        // frames * ratio — it varies by a frame as the filter state advances.
+        let maxOutputFrames =
+            UInt32(ceil(Double(maxFrames) * (outputFormat.mSampleRate / inputSampleRate))) + converterOutputSlack
         if maxOutputFrames > conversionBufferSize {
             conversionBuffer?.deallocate()
             conversionBuffer = UnsafeMutablePointer<Int16>.allocate(capacity: Int(maxOutputFrames))
             conversionBufferSize = maxOutputFrames
         }
 
+        setupConverter(inputSampleRate: inputSampleRate, inputChannels: 1)
+
         if resetQueuedAudio {
             resetAudioProcessingState()
         }
+    }
+
+    // MARK: - Sample Rate Conversion
+
+    /// Creates (or recreates) the Core Audio converter that resamples the mono
+    /// capture stream down to the transcription format. Kept alive across render
+    /// buffers so its filter state is continuous.
+    private func setupConverter(inputSampleRate: Double, inputChannels: UInt32) {
+        guard inputSampleRate > 0 else { return }
+
+        if converter != nil,
+            converterInputSampleRate == inputSampleRate,
+            converterInputChannels == inputChannels
+        {
+            AudioConverterReset(converter!)
+            return
+        }
+
+        disposeConverter()
+
+        var sourceFormat = AudioStreamBasicDescription(
+            mSampleRate: inputSampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(MemoryLayout<Float32>.size) * inputChannels,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(MemoryLayout<Float32>.size) * inputChannels,
+            mChannelsPerFrame: inputChannels,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+
+        var destinationFormat = outputFormat
+        var newConverter: AudioConverterRef?
+        let status = AudioConverterNew(&sourceFormat, &destinationFormat, &newConverter)
+
+        guard status == noErr, let newConverter else {
+            logger.error("🎙️ AudioConverterNew failed: \(status, privacy: .public)")
+            return
+        }
+
+        // Linear-phase, highest quality. This runs on a mono 48kHz stream off the
+        // realtime thread, so the cost is negligible.
+        var quality = kAudioConverterQuality_Max
+        AudioConverterSetProperty(
+            newConverter,
+            kAudioConverterSampleRateConverterQuality,
+            UInt32(MemoryLayout<UInt32>.size),
+            &quality
+        )
+        var complexity = kAudioConverterSampleRateConverterComplexity_Mastering
+        AudioConverterSetProperty(
+            newConverter,
+            kAudioConverterSampleRateConverterComplexity,
+            UInt32(MemoryLayout<UInt32>.size),
+            &complexity
+        )
+
+        converter = newConverter
+        converterInputSampleRate = inputSampleRate
+        converterInputChannels = inputChannels
+
+        logger.notice(
+            "🎙️ Converter ready: \(Int(inputSampleRate), privacy: .public)Hz → \(Int(self.outputFormat.mSampleRate), privacy: .public)Hz (mastering quality)"
+        )
+    }
+
+    private func disposeConverter() {
+        if let converter {
+            AudioConverterDispose(converter)
+        }
+        converter = nil
+        converterInputSampleRate = 0
+        converterInputChannels = 0
     }
 
     private func setupInputCallback() throws {
@@ -774,6 +917,14 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
     private func freeBuffers() {
         drainAudioProcessingQueue()
+
+        disposeConverter()
+
+        if let buffer = monoBuffer {
+            buffer.deallocate()
+            monoBuffer = nil
+            monoBufferSize = 0
+        }
 
         if let buffer = conversionBuffer {
             buffer.deallocate()
@@ -998,6 +1149,20 @@ final class CoreAudioRecorder: @unchecked Sendable {
         }
     }
 
+    /// Pushes out the samples still inside the converter's filter so the tail of
+    /// the recording isn't clipped.
+    private func flushConverterTail() {
+        guard converter != nil, audioFile != nil else { return }
+
+        if DispatchQueue.getSpecific(key: audioProcessingQueueKey) != nil {
+            drainConverter(inputSamples: nil, frameCount: 0)
+        } else {
+            audioProcessingQueue.sync {
+                drainConverter(inputSamples: nil, frameCount: 0)
+            }
+        }
+    }
+
     private func drainAudioProcessingQueue() {
         if DispatchQueue.getSpecific(key: audioProcessingQueueKey) != nil {
             processQueuedInputBuffers()
@@ -1037,80 +1202,105 @@ final class CoreAudioRecorder: @unchecked Sendable {
         inputChannels: UInt32,
         inputSampleRate: Double
     ) {
-        guard let file = audioFile else { return }
-
-        let outputSampleRate = outputFormat.mSampleRate
-
-        // Calculate output frame count after sample rate conversion
-        let ratio = outputSampleRate / inputSampleRate
-        let outputFrameCount = UInt32(Double(frameCount) * ratio)
-
-        guard outputFrameCount > 0,
-            let outputBuffer = conversionBuffer,
-            outputFrameCount <= conversionBufferSize
+        guard frameCount > 0,
+            inputChannels > 0,
+            let monoSamples = monoBuffer,
+            frameCount <= monoBufferSize
         else { return }
 
-        // Convert Float32 multi-channel → Int16 mono (with sample rate conversion if needed)
-        if inputSampleRate == outputSampleRate {
-            // Direct conversion, just format change and channel mixing
+        // Downmix to mono first; the converter then only has to deal with rate.
+        if inputChannels == 1 {
+            monoSamples.update(from: inputSamples, count: Int(frameCount))
+        } else {
+            let channels = Int(inputChannels)
             for i in 0..<Int(frameCount) {
                 var sample: Float32 = 0
-                // Mix all channels to mono
-                for ch in 0..<Int(inputChannels) {
-                    sample += inputSamples[i * Int(inputChannels) + ch]
+                for ch in 0..<channels {
+                    sample += inputSamples[i * channels + ch]
                 }
-                sample /= Float32(inputChannels)
-
-                // Convert to Int16 with clipping
-                let scaled = sample * 32767.0
-                let clipped = max(-32768.0, min(32767.0, scaled))
-                outputBuffer[i] = Int16(clipped)
-            }
-        } else {
-            // Sample rate conversion needed - use linear interpolation
-            for i in 0..<Int(outputFrameCount) {
-                let inputIndex = Double(i) / ratio
-                let inputIndexInt = Int(inputIndex)
-                let frac = Float32(inputIndex - Double(inputIndexInt))
-
-                var sample: Float32 = 0
-                let idx1 = min(inputIndexInt, Int(frameCount) - 1)
-                let idx2 = min(inputIndexInt + 1, Int(frameCount) - 1)
-
-                // Mix channels and interpolate
-                for ch in 0..<Int(inputChannels) {
-                    let s1 = inputSamples[idx1 * Int(inputChannels) + ch]
-                    let s2 = inputSamples[idx2 * Int(inputChannels) + ch]
-                    sample += s1 + frac * (s2 - s1)
-                }
-                sample /= Float32(inputChannels)
-
-                // Convert to Int16
-                let scaled = sample * 32767.0
-                let clipped = max(-32768.0, min(32767.0, scaled))
-                outputBuffer[i] = Int16(clipped)
+                monoSamples[i] = sample / Float32(channels)
             }
         }
 
-        // Write to file
-        var outputBufferList = AudioBufferList(
-            mNumberBuffers: 1,
-            mBuffers: AudioBuffer(
-                mNumberChannels: 1,
-                mDataByteSize: outputFrameCount * 2,
-                mData: outputBuffer
-            )
+        if converter == nil || converterInputSampleRate != inputSampleRate {
+            setupConverter(inputSampleRate: inputSampleRate, inputChannels: 1)
+        }
+
+        drainConverter(inputSamples: monoSamples, frameCount: frameCount)
+    }
+
+    /// Feeds one buffer through the converter and writes everything it yields.
+    /// Passing frameCount == 0 flushes the filter's tail.
+    private func drainConverter(inputSamples: UnsafeMutablePointer<Float32>?, frameCount: UInt32) {
+        guard let converter,
+            let outputBuffer = conversionBuffer,
+            conversionBufferSize > 0
+        else { return }
+
+        var payload = ConverterInputPayload(
+            samples: inputSamples,
+            frameCount: frameCount,
+            consumed: frameCount == 0
         )
 
-        let writeStatus = ExtAudioFileWrite(file, outputFrameCount, &outputBufferList)
-        if writeStatus != noErr {
-            logger.error("🎙️ ExtAudioFileWrite failed with status: \(writeStatus, privacy: .public)")
+        while true {
+            var outputFrames = conversionBufferSize
+            var outputBufferList = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(
+                    mNumberChannels: 1,
+                    mDataByteSize: conversionBufferSize * UInt32(MemoryLayout<Int16>.size),
+                    mData: UnsafeMutableRawPointer(outputBuffer)
+                )
+            )
+
+            let status = withUnsafeMutablePointer(to: &payload) { payloadPointer in
+                AudioConverterFillComplexBuffer(
+                    converter,
+                    converterInputProc,
+                    payloadPointer,
+                    &outputFrames,
+                    &outputBufferList,
+                    nil
+                )
+            }
+
+            if status != noErr {
+                logger.error("🎙️ AudioConverterFillComplexBuffer failed: \(status, privacy: .public)")
+                return
+            }
+
+            guard outputFrames > 0 else { return }
+
+            writeConvertedFrames(outputBuffer, frameCount: outputFrames)
+
+            if payload.consumed {
+                return
+            }
+        }
+    }
+
+    private func writeConvertedFrames(_ samples: UnsafeMutablePointer<Int16>, frameCount: UInt32) {
+        if let file = audioFile {
+            var outputBufferList = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(
+                    mNumberChannels: 1,
+                    mDataByteSize: frameCount * UInt32(MemoryLayout<Int16>.size),
+                    mData: UnsafeMutableRawPointer(samples)
+                )
+            )
+
+            let writeStatus = ExtAudioFileWrite(file, frameCount, &outputBufferList)
+            if writeStatus != noErr {
+                logger.error("🎙️ ExtAudioFileWrite failed with status: \(writeStatus, privacy: .public)")
+            }
         }
 
         // Send the same PCM data to the streaming callback if set.
         if let audioChunk = onAudioChunk {
-            let byteCount = Int(outputFrameCount) * MemoryLayout<Int16>.size
-            let data = Data(bytes: outputBuffer, count: byteCount)
+            let byteCount = Int(frameCount) * MemoryLayout<Int16>.size
+            let data = Data(bytes: samples, count: byteCount)
             audioChunk(data)
         }
     }
