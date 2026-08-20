@@ -267,6 +267,10 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
         let shouldInvalidatePreparation = capturedTooLittleAudio()
         closeOutputFile()
+
+        if let url = recordingURL {
+            normalizeRecordedFile(at: url)
+        }
         recordingURL = nil
 
         // Rebuild the input next time if too little audio was captured.
@@ -895,6 +899,25 @@ final class CoreAudioRecorder: @unchecked Sendable {
         if let file = audioFile {
             ExtAudioFileDispose(file)
             audioFile = nil
+        }
+    }
+
+    /// Brings the finished recording to a consistent speech level. Runs once the
+    /// file is closed and before transcription opens it, so playback and the
+    /// transcriber both see the same normalized audio.
+    private func normalizeRecordedFile(at url: URL) {
+        do {
+            let gain = try AudioLevelNormalizer.normalize(
+                fileAt: url,
+                sampleRate: outputFormat.mSampleRate
+            )
+            if gain != 1.0 {
+                let decibels = 20 * log10(gain)
+                logger.notice("🎙️ Normalized recording by \(String(format: "%+.1f", decibels), privacy: .public) dB")
+            }
+        } catch {
+            // Levelling is cosmetic — never lose a recording over it.
+            logger.warning("🎙️ Could not normalize recording: \(error.localizedDescription, privacy: .public)")
         }
     }
 
