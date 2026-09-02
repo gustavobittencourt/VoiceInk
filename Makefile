@@ -5,6 +5,12 @@ FRAMEWORK_PATH := $(WHISPER_CPP_DIR)/build-apple/whisper.xcframework
 LOCAL_DERIVED_DATA := $(CURDIR)/.local-build
 LOCAL_CODESIGN_IDENTITY ?=
 RUN_APP_NAME ?= VoiceInk
+# Nome do certificado auto-assinado usado quando nao ha conta paga de desenvolvedor.
+# Criar uma vez pelo Keychain Access (Certificate Assistant > Create a Certificate,
+# type "Code Signing", self-signed) e o nome aqui passa a valer para sempre.
+LOCAL_SELF_SIGNED_CN ?= VoiceInk Local Signing
+# Hash da identidade acima, se ela existir no keychain. Vazio = nao ha.
+LOCAL_SELF_SIGNED_ID := $(shell security find-identity -v -p codesigning 2>/dev/null | awk '/"$(LOCAL_SELF_SIGNED_CN)"/ { print $$2; exit }')
 
 .PHONY: all clean whisper setup build local check healthcheck help dev run release release-setup
 
@@ -64,6 +70,10 @@ local: check setup
 			echo "Multiple Apple Development identities found; set LOCAL_CODESIGN_IDENTITY to choose one; using ad-hoc signing"; \
 		fi; \
 	fi; \
+	if [ -z "$$SIGNING_IDENTITY" ] && [ -n "$(LOCAL_SELF_SIGNED_ID)" ]; then \
+		SIGNING_IDENTITY="$(LOCAL_SELF_SIGNED_ID)"; \
+		echo "No Apple Development identity; using the self-signed '$(LOCAL_SELF_SIGNED_CN)' certificate"; \
+	fi; \
 	if [ -n "$$SIGNING_IDENTITY" ] && [ "$$SIGNING_IDENTITY" != "-" ]; then \
 		SIGNING_REQUIRED=YES; \
 		echo "Using stable local signing identity: $$SIGNING_IDENTITY"; \
@@ -75,8 +85,6 @@ local: check setup
 	xcodebuild -project VoiceInk.xcodeproj -scheme VoiceInk -configuration Release \
 		-derivedDataPath "$(LOCAL_DERIVED_DATA)" \
 		-xcconfig LocalBuild.xcconfig \
-		-skipPackagePluginValidation \
-		-skipMacroValidation \
 		CODE_SIGN_IDENTITY="$$SIGNING_IDENTITY" \
 		CODE_SIGNING_REQUIRED="$$SIGNING_REQUIRED" \
 		CODE_SIGNING_ALLOWED=YES \
@@ -86,13 +94,26 @@ local: check setup
 		-skipPackagePluginValidation \
 		-skipMacroValidation \
 		build
-	@APP_PATH="$(LOCAL_DERIVED_DATA)/Build/Products/Release/VoiceInk.app" && \
+	@SIGN_ID="$(LOCAL_CODESIGN_IDENTITY)"; \
+	if [ -z "$$SIGN_ID" ]; then \
+		SIGN_ID=$$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development: / { n++; id=$$2 } END { if (n==1) print id }'); \
+	fi; \
+	if [ -z "$$SIGN_ID" ]; then SIGN_ID="$(LOCAL_SELF_SIGNED_ID)"; fi; \
+	APP_PATH="$(LOCAL_DERIVED_DATA)/Build/Products/Release/VoiceInk.app" && \
 	if [ -d "$$APP_PATH" ]; then \
 		echo "Copying VoiceInk.app to ~/Downloads..."; \
 		rm -rf "$$HOME/Downloads/VoiceInk.app"; \
 		ditto "$$APP_PATH" "$$HOME/Downloads/VoiceInk.app"; \
 		xattr -cr "$$HOME/Downloads/VoiceInk.app"; \
 		echo ""; \
+		if [ -n "$$SIGN_ID" ]; then \
+			echo "Re-signing with the stable identity (xcodebuild signs ad-hoc because LocalBuild.xcconfig pins CODE_SIGN_IDENTITY = -)..."; \
+			codesign --force --sign "$$SIGN_ID" --preserve-metadata=identifier,entitlements,flags --generate-entitlement-der "$$HOME/Downloads/VoiceInk.app" || exit 1; \
+			codesign --verify --verbose=1 "$$HOME/Downloads/VoiceInk.app" || exit 1; \
+			echo "Signed by: $$(codesign -dv --verbose=2 "$$HOME/Downloads/VoiceInk.app" 2>&1 | awk -F= '/^Authority=/ { print $$2; exit }')"; \
+		else \
+			echo "WARNING: ad-hoc signature — macOS will ask for permissions again after this build."; \
+		fi; \
 		echo "Build complete! App saved to: ~/Downloads/VoiceInk.app"; \
 		echo "Run with: open ~/Downloads/VoiceInk.app"; \
 		echo ""; \
