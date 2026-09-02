@@ -97,7 +97,7 @@ struct VoiceInkApp: App {
         // Initialize services with proper sharing of instances
         let aiService = AIService()
         _aiService = StateObject(wrappedValue: aiService)
-        aiService.refreshOllamaAvailabilityInBackground()
+        aiService.refreshOllamaAvailabilityAtLaunch()
         Task { @MainActor in
             await aiService.fetchOpenRouterModelsIfNeededForMigration()
         }

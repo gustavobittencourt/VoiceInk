@@ -639,6 +639,40 @@ class AIService: ObservableObject {
         }
     }
 
+    /// Probe do Ollama feito no launch do app, com retentativas.
+    ///
+    /// Diferente de `refreshOllamaAvailabilityInBackground`, que atende cliques na UI
+    /// (onde falhar rapido e o comportamento certo), este caminho existe para o boot da
+    /// maquina: o VoiceInk sobe praticamente junto com um servidor local iniciado por
+    /// LaunchAgent -- medido, 1 segundo de diferenca -- e o probe unico encontrava a
+    /// porta ainda fechada, marcava `isConnected = false` e so um Refresh manual
+    /// recuperava a conexao.
+    ///
+    /// Sao ate 3 retentativas com backoff exponencial e espera estocastica: a base
+    /// cresce 2s -> 8s -> 24s e cada espera recebe um jitter aleatorio de +/-25%, para
+    /// que varias reinicializacoes nao caiam sempre no mesmo instante de um servidor
+    /// que tambem esta subindo. Interrompe assim que conectar.
+    func refreshOllamaAvailabilityAtLaunch() {
+        Task { [weak self] in
+            guard let self else { return }
+
+            let baseDelaysInSeconds: [Double] = [2, 8, 24]
+
+            for attempt in 0...baseDelaysInSeconds.count {
+                if attempt > 0 {
+                    let jittered = baseDelaysInSeconds[attempt - 1] * Double.random(in: 0.75...1.25)
+                    try? await Task.sleep(nanoseconds: UInt64(jittered * 1_000_000_000))
+                    if Task.isCancelled { return }
+                }
+
+                _ = await self.refreshOllamaAvailability()
+
+                let connected = await MainActor.run { self.ollamaService.isConnected }
+                if connected { return }
+            }
+        }
+    }
+
     @MainActor
     @discardableResult
     func refreshOllamaConnectionAndModels() async -> [OllamaModel] {
