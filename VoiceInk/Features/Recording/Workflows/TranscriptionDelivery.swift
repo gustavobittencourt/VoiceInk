@@ -2,6 +2,16 @@ import AppKit
 import Foundation
 import os
 
+/// Entrega a transcrição no app que estava em foco quando a gravação começou,
+/// em vez de onde o usuário estiver quando a transcrição fica pronta.
+enum PasteTargetPinning {
+    static let userDefaultsKey = "PinPasteTargetToRecordStart"
+
+    static var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: userDefaultsKey) as? Bool ?? true
+    }
+}
+
 @MainActor
 final class TranscriptionDelivery {
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "TranscriptionDelivery")
@@ -172,6 +182,7 @@ final class TranscriptionDelivery {
         SoundManager.shared.playStopSound()
         await actions.dismiss()
 
+        await activateRecordStartTarget()
         let pasteTask = CursorPaster.startPasteAtCursor(pastedText)
 
         Task { @MainActor in
@@ -185,6 +196,34 @@ final class TranscriptionDelivery {
                 CursorPaster.performSendKey(sendKey)
             }
         }
+    }
+
+    /// Reativa o app capturado no início da gravação e espera ele voltar a ser
+    /// frontmost. É obrigatório esperar: `CursorPaster` posta o Cmd+V em
+    /// `.cghidEventTap`, que entrega ao frontmost do instante do evento — não
+    /// existe destino no evento, nem pid nem janela.
+    private func activateRecordStartTarget() async {
+        guard PasteTargetPinning.isEnabled,
+            let target = ActiveWindowService.shared.currentApplication,
+            !target.isTerminated,
+            target.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier
+        else { return }
+
+        // Nada de `activateIgnoringOtherApps`: o compilador avisa que no macOS 14+
+        // a opção "will have no effect" — usá-la daria a falsa impressão de forçar
+        // o foco. `activate()` é o caminho atual, sujeito à ativação cooperativa.
+        _ = target.activate()
+
+        // Polling em vez de sleep fixo: troca de Space e app em fullscreen levam
+        // mais do que qualquer constante que a gente chutasse aqui.
+        let deadline = Date().addingTimeInterval(0.6)
+        while Date() < deadline {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        logger.notice("Paste target did not regain focus in time; pasting into the frontmost app")
     }
 
     private func deliverableText(from text: String) -> String {
