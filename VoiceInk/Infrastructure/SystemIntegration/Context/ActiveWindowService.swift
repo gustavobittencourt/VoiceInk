@@ -26,10 +26,15 @@ class ActiveWindowService: ObservableObject {
             logger.notice("Mode detection id=\(diagnosticID, privacy: .public) result=skipped-inactive-request")
             return Task {}
         }
+        // Alvo da colagem, lido depois por TranscriptionDelivery. Capturado antes
+        // do early-return de modeId: o atalho de modo específico retorna ali e
+        // deixaria o alvo sem registro.
+        let frontmostAtRecordStart = NSWorkspace.shared.frontmostApplication
 
         if let modeId = modeId,
             let config = ModeManager.shared.getConfiguration(with: modeId)
         {
+            currentApplication = frontmostAtRecordStart
             ModeManager.shared.setActiveConfiguration(config)
             logger.notice("Mode detection id=\(diagnosticID, privacy: .public) result=explicit-mode mode=\(config.id.uuidString, privacy: .public) name=\(config.name, privacy: .private)")
             return Task {}
@@ -38,7 +43,7 @@ class ActiveWindowService: ObservableObject {
             logger.notice("Mode detection id=\(diagnosticID, privacy: .public) requestedMode=\(modeId.uuidString, privacy: .public) result=missing-explicit-mode continuing=automatic-detection")
         }
 
-        guard let frontmostApp = NSWorkspace.shared.frontmostApplication,
+        guard let frontmostApp = frontmostAtRecordStart,
             let bundleIdentifier = frontmostApp.bundleIdentifier
         else {
             logger.notice("Mode detection id=\(diagnosticID, privacy: .public) result=no-frontmost-app-or-bundle-id")
