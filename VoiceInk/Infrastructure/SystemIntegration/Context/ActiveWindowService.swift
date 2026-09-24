@@ -20,15 +20,21 @@ class ActiveWindowService: ObservableObject {
         modeId: UUID? = nil,
         shouldApply: @escaping @MainActor () -> Bool = { true }
     ) -> Task<Void, Never> {
+        // Alvo da colagem, lido depois por TranscriptionDelivery. Capturado antes
+        // do early-return de modeId: o atalho de modo específico retorna ali e
+        // deixaria o alvo sem registro.
+        let frontmostAtRecordStart = NSWorkspace.shared.frontmostApplication
+
         if let modeId = modeId,
             let config = ModeManager.shared.getConfiguration(with: modeId)
         {
             guard shouldApply() else { return Task {} }
+            currentApplication = frontmostAtRecordStart
             ModeManager.shared.setActiveConfiguration(config)
             return Task {}
         }
 
-        guard let frontmostApp = NSWorkspace.shared.frontmostApplication,
+        guard let frontmostApp = frontmostAtRecordStart,
             let bundleIdentifier = frontmostApp.bundleIdentifier
         else {
             return Task {}
