@@ -20,6 +20,7 @@ struct SettingsView: View {
     @AppStorage("clipboardRestoreDelay") private var clipboardRestoreDelay = 2.0
     @AppStorage(SmartPunctuation.settingsKey) private var smartPunctuationEnabled = false
     @AppStorage(PasteMethod.userDefaultsKey) private var pasteMethodRawValue = PasteMethod.standard.rawValue
+    @AppStorage(PasteTargetPinning.userDefaultsKey) private var pinPasteTargetToRecordStart = true
     @AppStorage(AppAppearancePreference.userDefaultsKey) private var appAppearancePreference = AppAppearancePreference
         .system
     @AppStorage(AppLanguagePreference.userDefaultsKey) private var appLanguagePreference = AppLanguagePreference
@@ -135,6 +136,15 @@ struct SettingsView: View {
             }
 
             Section("Pasting") {
+                Toggle(isOn: $pinPasteTargetToRecordStart) {
+                    HStack(spacing: 4) {
+                        Text("Paste Into Original Window")
+                        InfoTip(
+                            "Brings back the app that was focused when the recording started, so the transcription lands where you began dictating instead of wherever you are when it finishes. Turn off if you prefer to start dictating and then click the target field."
+                        )
+                    }
+                }
+
                 Picker(selection: $finishAndSendKey) {
                     ForEach(FinishAndSendKey.allCases, id: \.self) { key in
                         Text(key.displayName).tag(key.rawValue)
