@@ -43,6 +43,8 @@ Configuração do user, medida em `defaults read com.prakashjoshipax.VoiceInk` e
 4. **Gravação iniciada no meio de uma sequência de colagens:** as colagens que faltam esperam a próxima parada, coerente com "segura até parar". Resta uma janela curta de corrida: se uma colagem acabou de trazer outro app para a frente, a gravação nova pode capturar esse app como origem. Aceito como risco conhecido.
 5. **`PasteTargetPinning` desligado** (opção do user, default ligado): a fila cola no app da frente, sem reativar origem e sem clipboard. A opção desligada é uma escolha explícita do user.
 6. **Base técnica:** reescrever sobre o código atual usando o PR #798 só como referência. O branch daquele PR está 345 commits atrás e metade dos arquivos mudou de lugar.
+7. **A palavra-gatilho não persiste mais o modo global.** Hoje ela chama `ModeManager.shared.setActiveConfiguration`, e o modo fica ativo até o próximo início de gravação redefini-lo (`ActiveWindowService.swift:46-52`, só quando existe config por app ou default). Com a fila, o modo ativado pela palavra-gatilho vale só para o item que a contém, para não contaminar a gravação viva. Com o único modo do user (`Dictation`), a diferença não aparece.
+8. **Transcrição de um item em paralelo com o enhancement do anterior:** fica para uma v2 (`.work-state/tech-debt.md`). Na v1 o item seguinte começa a transcrever quando o anterior chega ao turno de entrega, ou seja, depois do enhancement dele.
 
 O comportamento de falha do enhancement já existe: `TranscriptionPipeline.swift:206-221` mantém `finalText` igual ao texto cru e mostra notificação `.warning`. O que precisa ser garantido é que a fila siga depois disso.
 
