@@ -233,8 +233,13 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
             switch engine.recordingState {
             case .recording:
                 await engine.toggleRecord(modeId: modeId)
-            case .starting, .transcribing, .enhancing:
+            case .starting:
                 await cancelRecording()
+            case .transcribing, .enhancing:
+                // Fila processando: a pressão inicia a próxima gravação.
+                guard engine.canHandleRecordingShortcut else { return }
+                SoundManager.shared.playStartSound()
+                await engine.toggleRecord(modeId: modeId)
             case .idle:
                 if engine.assistantSession.canSendFollowUp {
                     SoundManager.shared.playStartSound()
@@ -317,7 +322,10 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
 
     func cancelRecording() async {
         guard let engine = engine else { return }
+        let wasLiveRecording = engine.isLiveRecording
         await engine.cancelRecording()
+        // Cancelou só a gravação viva: a fila segue e o painel continua.
+        if wasLiveRecording && engine.pendingJobCount > 0 { return }
         await dismissRecorderPanel()
     }
 

@@ -161,6 +161,11 @@ struct NotchRecorderView<S: RecorderStateProvider & ObservableObject>: View {
 
             HStack(spacing: 0) {
                 Spacer(minLength: 0)
+                RecorderPendingBadge(
+                    pendingCount: stateProvider.pendingJobCount,
+                    recordingState: stateProvider.recordingState
+                )
+                .padding(.trailing, 6)
                 RecorderStatusDisplay(
                     currentState: stateProvider.recordingState,
                     audioMeterProvider: recorder.audioMeterSnapshot,

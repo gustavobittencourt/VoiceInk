@@ -77,10 +77,6 @@ class RecordingShortcutManager: ObservableObject {
         }
     }
 
-    private static func canHandleShortcutAction(for recordingState: RecordingState) -> Bool {
-        recordingState != .transcribing && recordingState != .enhancing && recordingState != .busy
-    }
-
     init(engine: VoiceInkEngine, recorderUIManager: RecorderUIManager) {
         ShortcutMigration.migrateLegacyShortcutsIfNeeded()
 
@@ -103,10 +99,13 @@ class RecordingShortcutManager: ObservableObject {
 
         let shortcutModeHandler = RecordingShortcutModeHandler(
             canHandleShortcutAction: {
-                Self.canHandleShortcutAction(for: engine.recordingState)
+                engine.canHandleRecordingShortcut
             },
             isRecorderVisible: {
                 recorderUIManager.isRecorderPanelVisible
+            },
+            isProcessingWithoutLiveRecording: {
+                engine.isProcessingWithoutLiveRecording
             },
             recordingState: {
                 engine.recordingState
@@ -345,6 +344,9 @@ final class RecordingShortcutModeHandler {
 
     private let canHandleShortcutAction: @MainActor () -> Bool
     private let isRecorderVisible: @MainActor () -> Bool
+    /// Fila processando e nenhuma gravação viva: o painel está visível, mas a
+    /// pressão tem de iniciar uma gravação nova em vez de ser ignorada.
+    private let isProcessingWithoutLiveRecording: @MainActor () -> Bool
     private let recordingState: @MainActor () -> RecordingState
     private let isShortcutHeld: @MainActor (ShortcutAction) -> Bool
     private let finishHeldRecording: @MainActor () -> Void
@@ -368,6 +370,7 @@ final class RecordingShortcutModeHandler {
     init(
         canHandleShortcutAction: @escaping @MainActor () -> Bool,
         isRecorderVisible: @escaping @MainActor () -> Bool,
+        isProcessingWithoutLiveRecording: @escaping @MainActor () -> Bool,
         recordingState: @escaping @MainActor () -> RecordingState,
         isShortcutHeld: @escaping @MainActor (ShortcutAction) -> Bool,
         finishHeldRecording: @escaping @MainActor () -> Void,
@@ -376,6 +379,7 @@ final class RecordingShortcutModeHandler {
     ) {
         self.canHandleShortcutAction = canHandleShortcutAction
         self.isRecorderVisible = isRecorderVisible
+        self.isProcessingWithoutLiveRecording = isProcessingWithoutLiveRecording
         self.recordingState = recordingState
         self.isShortcutHeld = isShortcutHeld
         self.finishHeldRecording = finishHeldRecording
@@ -506,7 +510,7 @@ final class RecordingShortcutModeHandler {
                 return
             }
 
-            if !isRecorderVisible() {
+            if !isRecorderVisible() || isProcessingWithoutLiveRecording() {
                 guard canHandleShortcutAction() else {
                     logDecision(action, phase: "recording", result: "ignored-engine-state")
                     return
@@ -518,7 +522,7 @@ final class RecordingShortcutModeHandler {
             }
 
         case .pushToTalk:
-            if !isRecorderVisible() {
+            if !isRecorderVisible() || isProcessingWithoutLiveRecording() {
                 guard canHandleShortcutAction() else {
                     logDecision(action, phase: "recording", result: "ignored-engine-state")
                     return
@@ -562,7 +566,7 @@ final class RecordingShortcutModeHandler {
             logDecision(action, phase: "up", result: "toggle-release", detail: "mode=toggle")
 
         case .pushToTalk:
-            if isRecorderVisible() {
+            if isRecorderVisible() && !isProcessingWithoutLiveRecording() {
                 guard canHandleShortcutAction() else {
                     logDecision(action, phase: "recording", result: "ignored-engine-state")
                     return

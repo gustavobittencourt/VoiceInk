@@ -61,6 +61,12 @@ struct MiniRecorderView<S: RecorderStateProvider & ObservableObject>: View {
 
             Spacer(minLength: 0)
 
+            RecorderPendingBadge(
+                pendingCount: stateProvider.pendingJobCount,
+                recordingState: stateProvider.recordingState
+            )
+            .padding(.trailing, 6)
+
             RecorderModeButton(
                 buttonSize: 22,
                 padding: EdgeInsets()

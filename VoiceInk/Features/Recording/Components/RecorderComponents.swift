@@ -180,6 +180,34 @@ struct RecorderCloseButton: View {
     }
 }
 
+// MARK: - Pending Badge
+
+/// Gravações paradas que ainda não foram entregues. Com uma gravação só, o
+/// painel fica como antes: o selo aparece com gravação viva e algo na fila,
+/// ou com dois ou mais itens pendentes.
+struct RecorderPendingBadge: View {
+    let pendingCount: Int
+    let recordingState: RecordingState
+
+    private var isVisible: Bool {
+        let isLive = recordingState == .starting || recordingState == .recording
+        return pendingCount >= (isLive ? 1 : 2)
+    }
+
+    var body: some View {
+        if isVisible {
+            Text("\(pendingCount)")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.9))
+                .padding(.horizontal, 6)
+                .frame(height: 16)
+                .background(Capsule().fill(Color.white.opacity(0.2)))
+                .accessibilityLabel(String(localized: "\(pendingCount) pending"))
+                .help(String(localized: "Recordings still being processed"))
+        }
+    }
+}
+
 // MARK: - Processing Indicator
 
 struct ProcessingIndicator: View {
