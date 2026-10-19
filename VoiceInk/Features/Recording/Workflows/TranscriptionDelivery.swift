@@ -219,6 +219,9 @@ final class TranscriptionDelivery {
             restoreFocusTo.processIdentifier != target?.processIdentifier
         {
             _ = restoreFocusTo.activate()
+            _ = await FocusWait.until(timeout: 0.6) {
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == restoreFocusTo.processIdentifier
+            }
         }
     }
 
@@ -254,17 +257,15 @@ final class TranscriptionDelivery {
 
         // Polling em vez de sleep fixo: troca de Space e app em fullscreen levam
         // mais do que qualquer constante que a gente chutasse aqui.
-        let deadline = Date().addingTimeInterval(0.6)
-        while Date() < deadline {
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier {
-                return .paste(restoreFocusTo: frontmost)
-            }
-            try? await Task.sleep(nanoseconds: 30_000_000)
+        let targetBecameFrontmost = await FocusWait.until(timeout: 0.6) {
+            NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
         }
-        logger.notice("Paste target did not regain focus in time; copying to clipboard")
-        switch PasteTargetPolicy.afterActivation(targetBecameFrontmost: false) {
-        case .paste: return .paste(restoreFocusTo: frontmost)
-        case .copyToClipboard: return .copyToClipboard
+        switch PasteTargetPolicy.afterActivation(targetBecameFrontmost: targetBecameFrontmost) {
+        case .paste:
+            return .paste(restoreFocusTo: frontmost)
+        case .copyToClipboard:
+            logger.notice("Paste target did not regain focus in time; copying to clipboard")
+            return .copyToClipboard
         }
     }
 

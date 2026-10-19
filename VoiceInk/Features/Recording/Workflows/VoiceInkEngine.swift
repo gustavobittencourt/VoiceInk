@@ -470,7 +470,7 @@ class VoiceInkEngine: NSObject, ObservableObject {
                                 }
                             } else {
                                 self.currentSession = nil
-                                self.currentSessionTranscriptionConfiguration = transcriptionConfiguration
+                                self.currentSessionTranscriptionConfiguration = nil
                                 self.recorder.onAudioChunk = nil
                                 _ = realtimeAudioGate.reset()
                             }

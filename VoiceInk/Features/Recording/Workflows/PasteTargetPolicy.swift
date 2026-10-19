@@ -30,3 +30,23 @@ enum PasteTargetPolicy {
         targetBecameFrontmost ? .paste : .copyToClipboard
     }
 }
+
+/// Espera com prazo por uma troca de foco. `activate()` só pede o foco: se a
+/// próxima entrega da fila ler o app da frente antes da troca terminar, o
+/// Cmd+V dela cai no app errado.
+enum FocusWait {
+    @MainActor
+    static func until(
+        timeout: TimeInterval,
+        pollInterval: TimeInterval = 0.03,
+        _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if condition() { return true }
+            if Date() >= deadline { return false }
+            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+        }
+    }
+}
+
