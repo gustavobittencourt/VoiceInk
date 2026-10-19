@@ -12,7 +12,7 @@ LOCAL_SELF_SIGNED_CN ?= VoiceInk Local Signing
 # Hash da identidade acima, se ela existir no keychain. Vazio = nao ha.
 LOCAL_SELF_SIGNED_ID := $(shell security find-identity -v -p codesigning 2>/dev/null | awk '/"$(LOCAL_SELF_SIGNED_CN)"/ { print $$2; exit }')
 
-.PHONY: all clean whisper setup build local check healthcheck help dev run release release-setup
+.PHONY: all clean whisper setup build local check healthcheck help dev run release release-setup test-unit
 
 # Default target
 all: check build
@@ -124,6 +124,10 @@ local: check setup
 		echo "Error: Could not find built VoiceInk.app at $$APP_PATH"; \
 		exit 1; \
 	fi
+
+# Testes unitários de lógica pura, fora do host app
+test-unit:
+	@./scripts/test-unit.sh
 
 # Run application
 run:
