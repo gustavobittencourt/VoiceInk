@@ -24,6 +24,15 @@ final class TranscriptionDelivery {
         let responseError: String?
         let isAssistantFollowUp: Bool
         let sendAfterPaste: Bool
+        /// App em foco quando ESTA gravação começou. Viaja com o item porque,
+        /// com gravações concorrentes, o singleton do ActiveWindowService já
+        /// aponta para a gravação seguinte.
+        let pasteTarget: NSRunningApplication?
+    }
+
+    private enum PasteTargetResult {
+        case paste(restoreFocusTo: NSRunningApplication?)
+        case copyToClipboard
     }
 
     struct Actions {
@@ -59,7 +68,7 @@ final class TranscriptionDelivery {
 
         if let text = request.text {
             let sendKey = request.sendAfterPaste ? FinishAndSendSettings.selectedKey : request.output.autoSendKey
-            await paste(text, sendKey: sendKey, actions: actions)
+            await paste(text, sendKey: sendKey, target: request.pasteTarget, actions: actions)
         } else {
             await actions.dismiss()
         }
@@ -174,7 +183,9 @@ final class TranscriptionDelivery {
         String(format: "%.3f", duration)
     }
 
-    private func paste(_ text: String, sendKey: FinishAndSendKey, actions: Actions) async {
+    private func paste(
+        _ text: String, sendKey: FinishAndSendKey, target: NSRunningApplication?, actions: Actions
+    ) async {
         let textToPaste = deliverableText(from: text)
         let appendSpace = UserDefaults.standard.bool(forKey: "AppendTrailingSpace")
         let pastedText = textToPaste + (appendSpace ? " " : "")
@@ -182,19 +193,32 @@ final class TranscriptionDelivery {
         SoundManager.shared.playStopSound()
         await actions.dismiss()
 
-        await activateRecordStartTarget()
-        let pasteTask = CursorPaster.startPasteAtCursor(pastedText, sendKey: sendKey)
+        guard case .paste(let restoreFocusTo) = await activateRecordStartTarget(target) else {
+            _ = ClipboardManager.copyToClipboard(pastedText)
+            NotificationManager.shared.showNotification(
+                title: String(localized: "Original app is no longer available. Text copied to clipboard."),
+                type: .warning,
+                duration: 5.0
+            )
+            return
+        }
 
-        Task { @MainActor in
-            let pasteOutcome = await pasteTask.value
+        // Só retorna depois do Cmd+V: ele sai ≥ prePasteDelay depois do start,
+        // e a próxima gravação da fila ativaria o app dela nessa janela.
+        let pasteOutcome = await CursorPaster.startPasteAtCursor(pastedText, sendKey: sendKey).value
 
-            if sendKey.isEnabled && pasteOutcome.result.didPostPasteCommand {
-                try? await Task.sleep(nanoseconds: 150_000_000)
-                if let generation = pasteOutcome.autoLearnGeneration {
-                    await AutoLearnService.shared.cancelForAutoSend(generation: generation)
-                }
-                CursorPaster.performSendKey(sendKey)
+        if sendKey.isEnabled && pasteOutcome.result.didPostPasteCommand {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            if let generation = pasteOutcome.autoLearnGeneration {
+                await AutoLearnService.shared.cancelForAutoSend(generation: generation)
             }
+            CursorPaster.performSendKey(sendKey)
+        }
+
+        if let restoreFocusTo, !restoreFocusTo.isTerminated,
+            restoreFocusTo.processIdentifier != target?.processIdentifier
+        {
+            _ = restoreFocusTo.activate()
         }
     }
 
@@ -202,12 +226,26 @@ final class TranscriptionDelivery {
     /// frontmost. É obrigatório esperar: `CursorPaster` posta o Cmd+V em
     /// `.cghidEventTap`, que entrega ao frontmost do instante do evento — não
     /// existe destino no evento, nem pid nem janela.
-    private func activateRecordStartTarget() async {
-        guard PasteTargetPinning.isEnabled,
-            let target = ActiveWindowService.shared.currentApplication,
-            !target.isTerminated,
-            target.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier
-        else { return }
+    /// Devolve `restoreFocusTo` = app que estava na frente antes da ativação,
+    /// para a entrega devolver o foco depois de colar.
+    private func activateRecordStartTarget(_ target: NSRunningApplication?) async -> PasteTargetResult {
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let plan = PasteTargetPolicy.plan(
+            pinningEnabled: PasteTargetPinning.isEnabled,
+            hasTarget: target != nil,
+            targetIsTerminated: target?.isTerminated ?? false,
+            targetIsFrontmost: target?.processIdentifier == frontmost?.processIdentifier
+        )
+        switch plan {
+        case .pasteInFrontmost:
+            return .paste(restoreFocusTo: nil)
+        case .copyToClipboard:
+            logger.notice("Paste target is no longer running; copying to clipboard")
+            return .copyToClipboard
+        case .activateTarget:
+            break
+        }
+        guard let target else { return .paste(restoreFocusTo: nil) }
 
         // Nada de `activateIgnoringOtherApps`: o compilador avisa que no macOS 14+
         // a opção "will have no effect" — usá-la daria a falsa impressão de forçar
@@ -219,11 +257,15 @@ final class TranscriptionDelivery {
         let deadline = Date().addingTimeInterval(0.6)
         while Date() < deadline {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier {
-                return
+                return .paste(restoreFocusTo: frontmost)
             }
             try? await Task.sleep(nanoseconds: 30_000_000)
         }
-        logger.notice("Paste target did not regain focus in time; pasting into the frontmost app")
+        logger.notice("Paste target did not regain focus in time; copying to clipboard")
+        switch PasteTargetPolicy.afterActivation(targetBecameFrontmost: false) {
+        case .paste: return .paste(restoreFocusTo: frontmost)
+        case .copyToClipboard: return .copyToClipboard
+        }
     }
 
     private func deliverableText(from text: String) -> String {

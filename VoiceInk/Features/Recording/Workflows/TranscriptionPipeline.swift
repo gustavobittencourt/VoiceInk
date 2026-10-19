@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftData
 import os
@@ -62,6 +63,8 @@ class TranscriptionPipeline {
         cancelContextCapture: () -> Void = {},
         outputConfiguration: @escaping () -> OutputRuntimeConfiguration,
         sendAfterPaste: Bool = false,
+        pasteTarget: NSRunningApplication?,
+        awaitDeliveryTurn: @escaping () async -> Bool,
         onStateChange: @escaping (RecordingState) -> Void,
         shouldCancel: () -> Bool,
         onCancel: @escaping () async -> Void,
@@ -305,6 +308,13 @@ class TranscriptionPipeline {
             }
         }
 
+        // Fila de gravações: espera os itens anteriores serem entregues e não
+        // haver gravação viva. `false` = item cancelado enquanto esperava.
+        guard await awaitDeliveryTurn() else {
+            await finishCanceledTranscription()
+            return
+        }
+
         if shouldCancel() {
             await finishCanceledTranscription()
             return
@@ -318,7 +328,8 @@ class TranscriptionPipeline {
                 responseConfig: responseConfig,
                 responseError: responseError,
                 isAssistantFollowUp: assistant.isFollowUp,
-                sendAfterPaste: sendAfterPaste
+                sendAfterPaste: sendAfterPaste,
+                pasteTarget: pasteTarget
             ),
             actions: TranscriptionDelivery.Actions(
                 setState: onStateChange,

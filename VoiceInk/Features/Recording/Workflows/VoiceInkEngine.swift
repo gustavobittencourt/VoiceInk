@@ -651,6 +651,8 @@ class VoiceInkEngine: NSObject, ObservableObject {
                 ModeRuntimeResolver.outputConfiguration()
             },
             sendAfterPaste: sendAfterPaste,
+            pasteTarget: ActiveWindowService.shared.currentApplication,
+            awaitDeliveryTurn: { true },
             onStateChange: { [weak self] state in
                 guard let self, self.activePipelineTranscriptionID == transcriptionID else { return }
                 self.recordingState = state
