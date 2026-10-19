@@ -350,7 +350,10 @@ class VoiceInkEngine: NSObject, ObservableObject {
                         }
                         // Lido direto, no mesmo instante do ActiveWindowService: o
                         // singleton não é atualizado quando o app não tem bundle id.
-                        self.liveRecordStartPasteTarget = NSWorkspace.shared.frontmostApplication
+                        self.liveRecordStartPasteTarget = PasteTargetPolicy.recordStartTarget(
+                            frontmost: NSWorkspace.shared.frontmostApplication,
+                            focusBorrowedFrom: self.pipeline.focusBorrowedByDelivery
+                        )
                         let activeModeTask = ActiveWindowService.shared.beginApplyingConfiguration(modeId: modeId) {
                             [weak self] in
                             guard let self else { return false }

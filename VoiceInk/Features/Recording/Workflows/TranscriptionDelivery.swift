@@ -16,6 +16,11 @@ enum PasteTargetPinning {
 final class TranscriptionDelivery {
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "TranscriptionDelivery")
 
+    /// App que estava na frente quando a entrega ativou o app de origem para
+    /// colar; nil fora dessa janela. Uma gravação que começa nela lê o app
+    /// da entrega como frontmost.
+    private(set) var focusBorrowedFrom: NSRunningApplication?
+
     struct Request {
         let transcription: Transcription
         let text: String?
@@ -192,6 +197,7 @@ final class TranscriptionDelivery {
         actions.setState(.idle)
         SoundManager.shared.playStopSound()
         await actions.dismiss()
+        defer { focusBorrowedFrom = nil }
 
         guard case .paste(let restoreFocusTo) = await activateRecordStartTarget(target) else {
             _ = ClipboardManager.copyToClipboard(pastedText)
@@ -253,6 +259,7 @@ final class TranscriptionDelivery {
         // Nada de `activateIgnoringOtherApps`: o compilador avisa que no macOS 14+
         // a opção "will have no effect" — usá-la daria a falsa impressão de forçar
         // o foco. `activate()` é o caminho atual, sujeito à ativação cooperativa.
+        focusBorrowedFrom = frontmost
         _ = target.activate()
 
         // Polling em vez de sleep fixo: troca de Space e app em fullscreen levam

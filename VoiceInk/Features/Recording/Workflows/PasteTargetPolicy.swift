@@ -29,6 +29,13 @@ enum PasteTargetPolicy {
     static func afterActivation(targetBecameFrontmost: Bool) -> AfterActivation {
         targetBecameFrontmost ? .paste : .copyToClipboard
     }
+
+    /// App de origem de uma gravação que começa agora. Uma entrega em curso
+    /// pode ter ativado o app de outra gravação só para colar: o app do
+    /// usuário é o que estava na frente antes dessa ativação.
+    static func recordStartTarget<App>(frontmost: App?, focusBorrowedFrom: App?) -> App? {
+        focusBorrowedFrom ?? frontmost
+    }
 }
 
 /// Espera com prazo por uma troca de foco. `activate()` só pede o foco: se a

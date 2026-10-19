@@ -51,6 +51,17 @@ final class PasteTargetPolicyTests: XCTestCase {
     func testFocusedTargetPastes() {
         XCTAssertEqual(PasteTargetPolicy.afterActivation(targetBecameFrontmost: true), .paste)
     }
+
+    func testRecordStartTargetIsFrontmostWithoutDeliveryInFlight() {
+        XCTAssertEqual(PasteTargetPolicy.recordStartTarget(frontmost: "Notes", focusBorrowedFrom: nil), "Notes")
+    }
+
+    func testRecordStartTargetIgnoresAppActivatedByDelivery() {
+        XCTAssertEqual(
+            PasteTargetPolicy.recordStartTarget(frontmost: "TextEdit", focusBorrowedFrom: "Notes"),
+            "Notes"
+        )
+    }
 }
 
 @MainActor
