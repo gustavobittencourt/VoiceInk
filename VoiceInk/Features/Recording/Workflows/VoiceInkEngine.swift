@@ -92,6 +92,29 @@ class VoiceInkEngine: NSObject, ObservableObject {
         }
     }
 
+    /// Uma gravação parada, com tudo o que ela precisa para ser transcrita,
+    /// melhorada e entregue sem ler o estado da gravação viva seguinte.
+    private struct RecordingJob {
+        let transcription: Transcription
+        let audioURL: URL
+        let session: TranscriptionSession?
+        let transcriptionConfiguration: TranscriptionRuntimeConfiguration?
+        let contextStore: RecordingContextSnapshotStore?
+        /// Seguem preenchendo o store do item; o item as cancela ao terminar.
+        let contextCaptureTasks: [Task<Void, Never>]
+        let useCase: RecordingUseCase
+        let sendAfterPaste: Bool
+        let pasteTarget: NSRunningApplication?
+        /// Modo congelado na parada: a gravação seguinte troca o modo global.
+        let mode: ModeConfig?
+    }
+
+    /// Modo escolhido pela palavra-gatilho, válido só para o item que a contém.
+    private final class JobModeBox {
+        var mode: ModeConfig?
+    }
+
+    /// Estado exibido no painel: o da gravação viva ou, sem ela, o do item da vez.
     @Published var recordingState: RecordingState = .idle {
         didSet {
             guard oldValue != recordingState else { return }
@@ -100,16 +123,38 @@ class VoiceInkEngine: NSObject, ObservableObject {
     }
     @Published var shouldCancelRecording = false
     @Published var partialTranscript: String = ""
+    @Published private(set) var pendingJobCount = 0
     var currentSession: TranscriptionSession?
     private var currentSessionTranscriptionConfiguration: TranscriptionRuntimeConfiguration?
     private(set) var activeRecordingStartID: UUID?
-    private var activePipelineTranscriptionID: UUID?
-    private var canceledPipelineTranscriptionIDs = Set<UUID>()
     private var activeRecordingUseCase: RecordingUseCase = .newSession
-    private var activePipelineUseCase: RecordingUseCase = .newSession
     private var activeRecordingContextStore: RecordingContextSnapshotStore?
     private var activeRecordingContextTasks: [Task<Void, Never>] = []
     private var voiceInkRefinePreparationTask: Task<Void, Never>?
+
+    // Gravação viva (só .idle, .starting e .recording) separada da fila.
+    private var liveState: RecordingState = .idle
+    private var isStoppingLiveRecording = false
+    private var liveRecordStartPasteTarget: NSRunningApplication?
+
+    private let jobQueue = RecordingJobQueue()
+    private var jobsByID: [UUID: RecordingJob] = [:]
+    private var jobDisplayStates: [UUID: RecordingState] = [:]
+    /// Itens de assistente ou saída `.respond`: usam o painel e o `assistantSession`,
+    /// que são únicos, então bloqueiam novas gravações como antes.
+    private var blockingJobIDs = Set<UUID>()
+
+    var isLiveRecording: Bool {
+        liveState == .starting || liveState == .recording || isStoppingLiveRecording
+    }
+
+    var isProcessingWithoutLiveRecording: Bool {
+        !isLiveRecording && pendingJobCount > 0
+    }
+
+    var canHandleRecordingShortcut: Bool {
+        isLiveRecording || (blockingJobIDs.isEmpty && recordingState != .busy)
+    }
 
     let recorder = Recorder()
     var recordedFile: URL? = nil
@@ -165,6 +210,10 @@ class VoiceInkEngine: NSObject, ObservableObject {
 
         super.init()
 
+        jobQueue.onChange = { [weak self] in self?.refreshRecordingState() }
+        jobQueue.onIdle = { [weak self] in await self?.cleanupResourcesIfIdle() }
+        jobQueue.onDiscard = { [weak self] id in self?.discardJob(id) }
+
         setupNotifications()
         createRecordingsDirectoryIfNeeded()
     }
@@ -181,12 +230,16 @@ class VoiceInkEngine: NSObject, ObservableObject {
     // MARK: - Toggle Record
 
     func toggleRecord(modeId: UUID? = nil, isAssistantFollowUp: Bool = false, sendAfterPaste: Bool = false) async {
-        if recordingState == .starting {
+        if isStoppingLiveRecording {
+            return
+        }
+
+        if liveState == .starting {
             await cancelRecording()
             return
         }
 
-        if recordingState == .recording {
+        if liveState == .recording {
             // Stopping the hardware suspends. Keep all inputs tied to this recording
             // before cancellation or a new recording can replace the shared state.
             let audioURL = recordedFile
@@ -198,12 +251,17 @@ class VoiceInkEngine: NSObject, ObservableObject {
             let transcription = audioURL.map {
                 makeRecordingTranscription(for: $0, text: "", duration: 0, transcriptionStatus: .pending)
             }
-            activePipelineUseCase = activeRecordingUseCase
+            let useCase = activeRecordingUseCase
+            // Modo e app de origem congelados na parada: a gravação seguinte troca os dois.
+            let mode = ModeManager.shared.currentEffectiveConfiguration
+            let pasteTarget = liveRecordStartPasteTarget
             activeRecordingUseCase = .newSession
             activeRecordingStartID = nil
             partialTranscript = ""
-            recordingState = .transcribing
+            isStoppingLiveRecording = true
+            setLiveState(.idle)
             await recorder.stopRecording()
+            isStoppingLiveRecording = false
 
             guard recordedFile == audioURL else {
                 contextStore?.vocabularyPreparation.finish()
@@ -212,6 +270,7 @@ class VoiceInkEngine: NSObject, ObservableObject {
                 if let transcription {
                     await saveCanceledRecording(transcription)
                 }
+                refreshRecordingState()
                 return
             }
 
@@ -221,15 +280,28 @@ class VoiceInkEngine: NSObject, ObservableObject {
                     try? modelContext.save()
                     NotificationCenter.default.post(name: .transcriptionCreated, object: transcription)
 
-                    await runPipeline(
-                        on: transcription,
+                    // Não espera o pipeline: a gravação vira item da fila e o
+                    // atalho fica livre para a próxima.
+                    let job = RecordingJob(
+                        transcription: transcription,
                         audioURL: audioURL,
-                        transcriptionConfiguration: transcriptionConfiguration,
                         session: session,
+                        transcriptionConfiguration: transcriptionConfiguration,
                         contextStore: contextStore,
                         contextCaptureTasks: contextCaptureTasks,
-                        sendAfterPaste: sendAfterPaste
+                        useCase: useCase,
+                        sendAfterPaste: sendAfterPaste,
+                        pasteTarget: pasteTarget,
+                        mode: mode
                     )
+                    currentSession = nil
+                    currentSessionTranscriptionConfiguration = nil
+                    self.recordedFile = nil
+                    liveRecordStartPasteTarget = nil
+                    // O item leva store e tasks; o estado vivo fica limpo para a próxima.
+                    activeRecordingContextStore = nil
+                    activeRecordingContextTasks = []
+                    enqueue(job)
                 } else {
                     await finishActiveRecorderCancellation()
                 }
@@ -238,14 +310,13 @@ class VoiceInkEngine: NSObject, ObservableObject {
                 if !shouldCancelRecording {
                     logger.error("❌ No recorded file found after stopping recording")
                 }
-                recordingState = .idle
-                await cleanupResources()
+                refreshRecordingState()
+                await cleanupResourcesIfIdle()
             }
         } else {
             let canContinueAssistantSession = isAssistantFollowUp && assistantSession.canSendFollowUp
             let recordingUseCase: RecordingUseCase = canContinueAssistantSession ? .assistantFollowUp : .newSession
 
-            activePipelineTranscriptionID = nil
             shouldCancelRecording = false
             partialTranscript = ""
             activeRecordingUseCase = recordingUseCase
@@ -259,7 +330,9 @@ class VoiceInkEngine: NSObject, ObservableObject {
             let permanentURL = recordingsDirectory.appendingPathComponent("\(UUID().uuidString).wav")
             recordedFile = permanentURL
             activeRecordingStartID = startID
-            recordingState = .starting
+            // `.starting` já no toque: a fila não cola nem esconde o painel
+            // durante a permissão e o preflight.
+            setLiveState(.starting)
 
             requestRecordPermission { [self] granted in
                 if granted {
@@ -275,6 +348,9 @@ class VoiceInkEngine: NSObject, ObservableObject {
                             await self.cancelRecording()
                             return
                         }
+                        // Lido direto, no mesmo instante do ActiveWindowService: o
+                        // singleton não é atualizado quando o app não tem bundle id.
+                        self.liveRecordStartPasteTarget = NSWorkspace.shared.frontmostApplication
                         let activeModeTask = ActiveWindowService.shared.beginApplyingConfiguration(modeId: modeId) {
                             [weak self] in
                             guard let self else { return false }
@@ -299,13 +375,13 @@ class VoiceInkEngine: NSObject, ObservableObject {
                                     if !shouldKeepRecordingFile {
                                         self.recordedFile = nil
                                     }
-                                    self.recordingState = .idle
+                                    self.setLiveState(.idle)
                                     self.activeRecordingStartID = nil
                                 }
                                 return
                             }
 
-                            self.recordingState = .recording
+                            self.setLiveState(.recording)
                             // Preserve the clipboard before awaiting mode resolution
                             // or any later selected-text Copy operation.
                             let clipboardText = SelectedTextService.captureClipboardText()
@@ -344,10 +420,10 @@ class VoiceInkEngine: NSObject, ObservableObject {
                                 await self.recorder.stopRecording()
                                 try? FileManager.default.removeItem(at: permanentURL)
                                 self.recordedFile = nil
-                                self.recordingState = .idle
+                                self.setLiveState(.idle)
                                 self.activeRecordingStartID = nil
                                 self.clearActiveRecordingContext()
-                                await self.cleanupResources()
+                                await self.cleanupResourcesIfIdle()
                                 await self.recorderUIManager?.dismissRecorderPanel()
                                 return
                             }
@@ -394,7 +470,7 @@ class VoiceInkEngine: NSObject, ObservableObject {
                                 }
                             } else {
                                 self.currentSession = nil
-                                self.currentSessionTranscriptionConfiguration = nil
+                                self.currentSessionTranscriptionConfiguration = transcriptionConfiguration
                                 self.recorder.onAudioChunk = nil
                                 _ = realtimeAudioGate.reset()
                             }
@@ -449,11 +525,11 @@ class VoiceInkEngine: NSObject, ObservableObject {
                             if let recordedFile = self.recordedFile {
                                 try? FileManager.default.removeItem(at: recordedFile)
                             }
-                            self.recordingState = .idle
+                            self.setLiveState(.idle)
                             self.recordedFile = nil
                             self.activeRecordingStartID = nil
                             self.clearActiveRecordingContext()
-                            await self.cleanupResources()
+                            await self.cleanupResourcesIfIdle()
                             if let failure = audioFailure {
                                 NotificationManager.shared.showNotification(
                                     title: failure.title,
@@ -472,7 +548,7 @@ class VoiceInkEngine: NSObject, ObservableObject {
                     if activeRecordingStartID == startID {
                         activeRecordingStartID = nil
                         recordedFile = nil
-                        recordingState = .idle
+                        setLiveState(.idle)
                     }
                     logger.error("Recording permission denied")
                 }
@@ -550,7 +626,7 @@ class VoiceInkEngine: NSObject, ObservableObject {
         logger.error("❌ Recording preflight failed: \(title, privacy: .public)")
         activeRecordingStartID = nil
         recordedFile = nil
-        recordingState = .idle
+        setLiveState(.idle)
         NotificationManager.shared.showNotification(
             title: title,
             type: .error,
@@ -583,50 +659,120 @@ class VoiceInkEngine: NSObject, ObservableObject {
         activeRecordingContextStore = nil
     }
 
+    // MARK: - Recording Queue
+
+    private func setLiveState(_ state: RecordingState) {
+        liveState = state
+        refreshRecordingState()
+    }
+
+    private func refreshRecordingState() {
+        let displayedState: RecordingState
+        if isStoppingLiveRecording {
+            displayedState = .transcribing
+        } else if liveState != .idle {
+            displayedState = liveState
+        } else if let headID = jobQueue.pendingIDs.first {
+            displayedState = jobDisplayStates[headID] ?? .transcribing
+        } else {
+            displayedState = .idle
+        }
+
+        if recordingState != displayedState {
+            recordingState = displayedState
+        }
+        jobQueue.isDeliveryHeld = isLiveRecording
+        if pendingJobCount != jobQueue.pendingCount {
+            pendingJobCount = jobQueue.pendingCount
+        }
+    }
+
+    /// Só guarda transcribing/enhancing: com fila pendente, o painel nunca pode
+    /// mostrar `.idle`, senão `toggleRecorderPanel` o dispensaria.
+    private func setJobDisplayState(_ state: RecordingState, for transcriptionID: UUID) {
+        if state == .transcribing || state == .enhancing {
+            jobDisplayStates[transcriptionID] = state
+        } else {
+            jobDisplayStates[transcriptionID] = nil
+        }
+        refreshRecordingState()
+    }
+
+    private func enqueue(_ job: RecordingJob) {
+        let transcriptionID = job.transcription.id
+        jobsByID[transcriptionID] = job
+        if job.useCase.isAssistantFollowUp
+            || ModeRuntimeResolver.outputConfiguration(mode: job.mode).outputMode == .respond
+        {
+            blockingJobIDs.insert(transcriptionID)
+        }
+
+        jobQueue.enqueue(id: transcriptionID) { [weak self] awaitDeliveryTurn in
+            await self?.runJob(job, awaitDeliveryTurn: awaitDeliveryTurn)
+        }
+        refreshRecordingState()
+    }
+
+    /// Item cancelado antes de começar a rodar: fica no histórico como cancelado.
+    private func discardJob(_ transcriptionID: UUID) {
+        guard let job = jobsByID.removeValue(forKey: transcriptionID) else { return }
+        job.session?.cancel()
+        job.transcription.text = Transcription.canceledTranscriptionText
+        job.transcription.transcriptionStatus = TranscriptionStatus.canceled.rawValue
+        do {
+            try modelContext.save()
+        } catch {
+            logger.error("Failed to save discarded recording: \(error, privacy: .public)")
+        }
+        blockingJobIDs.remove(transcriptionID)
+        jobDisplayStates[transcriptionID] = nil
+        refreshRecordingState()
+    }
+
     // MARK: - Pipeline Dispatch
 
-    private func runPipeline(
-        on transcription: Transcription,
-        audioURL: URL,
-        transcriptionConfiguration: TranscriptionRuntimeConfiguration?,
-        session: TranscriptionSession?,
-        contextStore: RecordingContextSnapshotStore?,
-        contextCaptureTasks: [Task<Void, Never>],
-        sendAfterPaste: Bool
+    private func runJob(
+        _ job: RecordingJob,
+        awaitDeliveryTurn: @escaping @MainActor () async -> Bool
     ) async {
-        defer { contextCaptureTasks.forEach { $0.cancel() } }
-        guard let transcriptionConfiguration else {
-            contextStore?.vocabularyPreparation.finish()
+        let transcription = job.transcription
+        let transcriptionID = transcription.id
+        defer {
+            job.contextCaptureTasks.forEach { $0.cancel() }
+            jobsByID[transcriptionID] = nil
+            jobDisplayStates[transcriptionID] = nil
+            blockingJobIDs.remove(transcriptionID)
+            refreshRecordingState()
+        }
+
+        // Resolvida na parada, com o modo daquele instante.
+        guard let transcriptionConfiguration = job.transcriptionConfiguration else {
+            job.contextStore?.vocabularyPreparation.finish()
             transcription.text = String(localized: "Transcription Failed: No model selected")
             transcription.transcriptionStatus = TranscriptionStatus.failed.rawValue
             try? modelContext.save()
-            recordingState = .idle
-            activePipelineUseCase = .newSession
             return
         }
 
-        let transcriptionID = transcription.id
-        activePipelineTranscriptionID = transcriptionID
-        let shouldCancel = { [weak self] in
-            guard let self else { return false }
-            return self.canceledPipelineTranscriptionIDs.contains(transcriptionID)
-                || (self.activePipelineTranscriptionID == transcriptionID && self.shouldCancelRecording)
-        }
-
-        let vocabularyPreparation = contextStore?.vocabularyPreparation ?? RecordingVocabularyPreparation(
+        let triggeredMode = JobModeBox()
+        let vocabularyPreparation = job.contextStore?.vocabularyPreparation ?? RecordingVocabularyPreparation(
             savedVocabulary: CustomVocabularyService.shared.loadSavedVocabulary(from: modelContext)
         )
 
         await pipeline.run(
             transcription: transcription,
-            audioURL: audioURL,
+            audioURL: job.audioURL,
             transcriptionConfiguration: transcriptionConfiguration,
             formattingConfiguration: {
-                ModeRuntimeResolver.transcriptionFormattingConfiguration()
+                ModeRuntimeResolver.transcriptionFormattingConfiguration(mode: triggeredMode.mode ?? job.mode)
             },
-            session: session,
-            triggerWordModeSelection: { [weak self] text in
-                self?.selectTriggerWordModeIfNeeded(for: text)
+            session: job.session,
+            triggerWordModeSelection: { text in
+                guard let (mode, processedText) = ModeManager.shared.getConfigurationForTriggerWord(text) else {
+                    return nil
+                }
+                triggeredMode.mode = mode
+                return processedText
             },
             enhancementConfiguration: { [weak self] in
                 guard let self,
@@ -636,44 +782,46 @@ class VoiceInkEngine: NSObject, ObservableObject {
                     return nil
                 }
                 return ModeRuntimeResolver.currentEnhancementConfiguration(
+                    mode: triggeredMode.mode ?? job.mode,
                     enhancementService: enhancementService,
                     aiService: aiService
                 )
             },
             vocabularyPreparation: vocabularyPreparation,
             recordingContextSnapshot: {
-                contextStore?.snapshot
+                job.contextStore?.snapshot
             },
             cancelContextCapture: {
-                contextCaptureTasks.forEach { $0.cancel() }
+                job.contextCaptureTasks.forEach { $0.cancel() }
             },
             outputConfiguration: {
-                ModeRuntimeResolver.outputConfiguration()
+                ModeRuntimeResolver.outputConfiguration(mode: triggeredMode.mode ?? job.mode)
             },
-            sendAfterPaste: sendAfterPaste,
-            pasteTarget: ActiveWindowService.shared.currentApplication,
-            awaitDeliveryTurn: { true },
+            sendAfterPaste: job.sendAfterPaste,
+            pasteTarget: job.pasteTarget,
+            awaitDeliveryTurn: awaitDeliveryTurn,
             onStateChange: { [weak self] state in
-                guard let self, self.activePipelineTranscriptionID == transcriptionID else { return }
-                self.recordingState = state
+                self?.setJobDisplayState(state, for: transcriptionID)
             },
-            shouldCancel: shouldCancel,
-            onCancel: { [weak self, session] in
-                guard let self else { return }
-                self.cancelPipelineSession(transcriptionID: transcriptionID, session: session)
+            shouldCancel: { [weak self] in
+                self?.jobQueue.isCanceled(transcriptionID) ?? false
+            },
+            onCancel: {
+                job.session?.cancel()
             },
             onDismiss: { [weak self] in
-                guard let self, self.activePipelineTranscriptionID == transcriptionID else { return }
+                // O painel fica enquanto houver gravação viva ou outro item na fila.
+                guard let self, !self.isLiveRecording, self.jobQueue.pendingCount <= 1 else { return }
                 await self.recorderUIManager?.dismissRecorderPanel()
             },
             assistant: TranscriptionPipeline.AssistantHooks(
-                isFollowUp: activePipelineUseCase.isAssistantFollowUp,
+                isFollowUp: job.useCase.isAssistantFollowUp,
                 sendFollowUp: { [weak self] text, transcription in
-                    guard let self, self.activePipelineTranscriptionID == transcriptionID else { return }
+                    guard let self, !self.jobQueue.isCanceled(transcriptionID) else { return }
                     await self.sendAssistantFollowUp(text, transcription: transcription)
                 },
                 startResponse: { [weak self] transcript, configuration in
-                    guard let self, self.activePipelineTranscriptionID == transcriptionID else { return }
+                    guard let self, !self.jobQueue.isCanceled(transcriptionID) else { return }
                     self.assistantSession.beginInitialResponse(
                         transcript: transcript,
                         provider: configuration.provider,
@@ -684,64 +832,41 @@ class VoiceInkEngine: NSObject, ObservableObject {
                     )
                 },
                 showResponse: { [weak self] response, systemPrompt in
-                    guard let self, self.activePipelineTranscriptionID == transcriptionID else { return }
+                    guard let self, !self.jobQueue.isCanceled(transcriptionID) else { return }
                     await self.completeAssistantResponse(response, systemPrompt: systemPrompt)
                 },
                 failResponse: { [weak self] message in
-                    guard let self, self.activePipelineTranscriptionID == transcriptionID else { return }
+                    guard let self, !self.jobQueue.isCanceled(transcriptionID) else { return }
                     self.assistantSession.fail(message)
                 }
             )
         )
-
-        defer {
-            canceledPipelineTranscriptionIDs.remove(transcriptionID)
-        }
-
-        guard activePipelineTranscriptionID == transcriptionID else { return }
-        await cleanupResources()
-        guard activePipelineTranscriptionID == transcriptionID else { return }
-
-        activePipelineTranscriptionID = nil
-        currentSession = nil
-        currentSessionTranscriptionConfiguration = nil
-        recordedFile = nil
-        shouldCancelRecording = false
-        activePipelineUseCase = .newSession
-        clearActiveRecordingContext()
-
-        if recordingState == .transcribing || recordingState == .enhancing || recordingState == .busy {
-            recordingState = .idle
-        }
-    }
-
-    private func selectTriggerWordModeIfNeeded(for text: String) -> String? {
-        guard let (triggeredMode, processedText) = ModeManager.shared.getConfigurationForTriggerWord(text) else {
-            return nil
-        }
-
-        ModeManager.shared.setActiveConfiguration(triggeredMode)
-        return processedText
     }
 
     // MARK: - Cancellation
 
+    /// Com gravação viva, cancela só ela. Sem gravação viva, cancela a fila toda.
     func cancelRecording() async {
+        if isStoppingLiveRecording {
+            // O ramo de parada do toggleRecord lê a flag e descarta a gravação.
+            shouldCancelRecording = true
+            return
+        }
+
         let shouldFinishSessionImmediately: Bool
-        switch recordingState {
-        case .starting, .recording:
+        if liveState == .starting || liveState == .recording {
             requestRecordingCancellation()
             await finishActiveRecorderCancellation()
             shouldFinishSessionImmediately = false
-        case .transcribing, .enhancing:
-            requestRecordingCancellation()
+        } else if jobQueue.pendingCount > 0 {
+            jobQueue.cancelAll()
             partialTranscript = ""
-            recordingState = .idle
+            refreshRecordingState()
             shouldFinishSessionImmediately = false
-        case .idle, .busy:
+        } else {
             partialTranscript = ""
             shouldCancelRecording = false
-            recordingState = .idle
+            setLiveState(.idle)
             shouldFinishSessionImmediately = true
         }
 
@@ -753,29 +878,21 @@ class VoiceInkEngine: NSObject, ObservableObject {
     func resetRecordingSession() async {
         cancelCurrentSession()
         activeRecordingStartID = nil
-        activePipelineTranscriptionID = nil
-        canceledPipelineTranscriptionIDs.removeAll()
+        jobQueue.cancelAll()
         shouldCancelRecording = false
         partialTranscript = ""
         assistantSession.reset()
         activeRecordingUseCase = .newSession
-        activePipelineUseCase = .newSession
         clearActiveRecordingContext()
         await recorder.stopRecording()
         recordedFile = nil
-        recordingState = .idle
+        isStoppingLiveRecording = false
+        setLiveState(.idle)
         await cleanupResources()
     }
 
     private func requestRecordingCancellation() {
         shouldCancelRecording = true
-
-        if (recordingState == .transcribing || recordingState == .enhancing),
-            let activePipelineTranscriptionID
-        {
-            canceledPipelineTranscriptionIDs.insert(activePipelineTranscriptionID)
-        }
-
         cancelCurrentSession()
     }
 
@@ -786,8 +903,8 @@ class VoiceInkEngine: NSObject, ObservableObject {
         await saveCanceledRecording()
         recordedFile = nil
         partialTranscript = ""
-        recordingState = .idle
-        await cleanupResources()
+        setLiveState(.idle)
+        await cleanupResourcesIfIdle()
     }
 
     private func saveCanceledRecording() async {
@@ -907,18 +1024,6 @@ class VoiceInkEngine: NSObject, ObservableObject {
 
     // MARK: - Resource Cleanup
 
-    private func cancelPipelineSession(transcriptionID: UUID, session: TranscriptionSession?) {
-        session?.cancel()
-
-        guard activePipelineTranscriptionID == transcriptionID else {
-            logger.notice("Skipping stale pipeline cleanup")
-            return
-        }
-
-        currentSession = nil
-        currentSessionTranscriptionConfiguration = nil
-    }
-
     private func cancelCurrentSession() {
         currentSession?.cancel()
         currentSession = nil
@@ -936,6 +1041,12 @@ class VoiceInkEngine: NSObject, ObservableObject {
             .getAIService()?
             .voiceInkRefineService
             .unloadPreparedModelIfNeeded()
+    }
+
+    /// Descarrega modelos só sem gravação viva e com a fila vazia.
+    private func cleanupResourcesIfIdle() async {
+        guard !isLiveRecording, jobQueue.pendingCount == 0 else { return }
+        await cleanupResources()
     }
 
     func cleanupResources() async {
