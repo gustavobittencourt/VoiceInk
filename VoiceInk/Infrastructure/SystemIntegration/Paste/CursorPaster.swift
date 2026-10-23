@@ -42,12 +42,14 @@ class CursorPaster {
 
     @MainActor
     @discardableResult
-    static func startPasteAtCursor(_ text: String, sendKey: FinishAndSendKey = .none) -> Task<PasteOutcome, Never> {
+    static func startPasteAtCursor(
+        _ text: String, sendKey: FinishAndSendKey = .none, precondition: (@MainActor () -> Bool)? = nil
+    ) -> Task<PasteOutcome, Never> {
         let requestedAt = ProcessInfo.processInfo.systemUptime
         let previousPasteTask = pasteQueueTask
         let sessionTask = Task { @MainActor in
             await previousPasteTask?.value
-            return await performPasteSession(text, sendKey: sendKey, requestedAt: requestedAt)
+            return await performPasteSession(text, sendKey: sendKey, requestedAt: requestedAt, precondition: precondition)
         }
 
         pasteQueueTask = Task { @MainActor in
@@ -62,7 +64,9 @@ class CursorPaster {
     }
 
     @MainActor
-    private static func performPasteSession(_ text: String, sendKey: FinishAndSendKey, requestedAt: TimeInterval) async -> (
+    private static func performPasteSession(
+        _ text: String, sendKey: FinishAndSendKey, requestedAt: TimeInterval, precondition: (@MainActor () -> Bool)?
+    ) async -> (
         outcome: PasteOutcome, clipboardRestoreTask: Task<Void, Never>?
     ) {
         let startedAt = ProcessInfo.processInfo.systemUptime
@@ -118,6 +122,14 @@ class CursorPaster {
 
         let application = NSWorkspace.shared.frontmostApplication
         let appIdentifier = application?.bundleIdentifier ?? "unknown"
+        // O Cmd+V vai ao app da frente do instante do evento. Depois da espera na fila
+        // o alvo pode ter mudado: quem chamou reconfere aqui, não antes da fila.
+        if let precondition, !precondition() {
+            logger.notice("Paste id=\(sessionID, privacy: .public) skipped: precondition failed after queue wait")
+            // Sem restaurar o clipboard: o texto fica nele (não transitório) para o user colar à mão.
+            if pasteboard != nil { _ = ClipboardManager.copyToClipboard(textToDeliver) }
+            return (PasteOutcome(result: .commandNotPosted, autoLearnGeneration: nil), nil)
+        }
         let focusDiagnostics = PasteFocusDiagnostics(sessionID: sessionID)
         focusDiagnostics.captureAroundPaste(processID: application?.processIdentifier, appIdentifier: appIdentifier)
         let pasteResult = await deliverText(textToDeliver, method: method, sendKey: sendKey, sessionID: sessionID)

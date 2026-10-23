@@ -211,7 +211,22 @@ final class TranscriptionDelivery {
 
         // Só retorna depois do Cmd+V: ele sai ≥ prePasteDelay depois do start,
         // e a próxima gravação da fila ativaria o app dela nessa janela.
-        let pasteOutcome = await CursorPaster.startPasteAtCursor(pastedText, sendKey: sendKey).value
+        // Reconfere o app da frente no instante do Cmd+V, depois da espera na fila do paster
+        // (até ~1,5 s no 2º item seguido; sem isso o texto cai no app que o user abriu nesse meio-tempo).
+        let frontPIDAtActivation = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        var targetChangedBeforePaste = false
+        let pasteOutcome = await CursorPaster.startPasteAtCursor(pastedText, sendKey: sendKey, precondition: {
+            let unchanged = NSWorkspace.shared.frontmostApplication?.processIdentifier == frontPIDAtActivation
+            targetChangedBeforePaste = !unchanged
+            return unchanged
+        }).value
+        if targetChangedBeforePaste {
+            NotificationManager.shared.showNotification(
+                title: String(localized: "The front app changed before pasting. Text copied to clipboard."),
+                type: .warning,
+                duration: 5.0
+            )
+        }
 
         if sendKey.isEnabled && pasteOutcome.result.didPostPasteCommand {
             try? await Task.sleep(nanoseconds: 150_000_000)
