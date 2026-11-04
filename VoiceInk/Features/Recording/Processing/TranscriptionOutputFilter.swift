@@ -30,11 +30,27 @@ struct TranscriptionOutputFilter {
             from: filteredText, fillers: FillerWordManager.shared.fillerWords, language: language
         )
 
+        filteredText = collapseInvoluntaryRepetitions(filteredText)
+
         // Normalize horizontal whitespace without flattening paragraphs or lists.
         filteredText = filteredText.replacingOccurrences(of: #"[ \t]{2,}"#, with: " ", options: .regularExpression)
         filteredText = filteredText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         return filteredText
+    }
+
+    private static func collapseInvoluntaryRepetitions(_ text: String) -> String {
+        let word = #"[\p{L}\p{M}\p{N}]"#
+        let separator = #"[\s,.;!?…]+"#
+        let patterns = [
+            (#"(?<!"# + word + #")(que)(?:"# + separator + #"\1){2,}(?!"# + word + #")"#, "$1 que"),
+            (#"(?<!"# + word + #")("# + word + #"+)(?:"# + separator + #"\1){3,}(?!"# + word + #")"#, "$1"),
+        ]
+        return patterns.reduce(text) { current, item in
+            guard let regex = try? NSRegularExpression(pattern: item.0, options: .caseInsensitive) else { return current }
+            return regex.stringByReplacingMatches(
+                in: current, range: NSRange(current.startIndex..., in: current), withTemplate: item.1)
+        }
     }
 }
 
