@@ -165,6 +165,28 @@ final class RecordingJobQueueTests: XCTestCase {
         XCTAssertTrue(queue.pendingIDs.isEmpty)
     }
 
+    /// Ordem do Esc duplo (`cancelEverything`): a fila é cancelada antes de a gravação
+    /// viva sair, e a retenção que cai depois não pode colar o item pronto.
+    func testHeldJobCanceledBeforeReleaseIsNotDelivered() async {
+        let queue = RecordingJobQueue()
+        queue.isDeliveryHeld = true
+        let log = EventLog()
+        let aInTurn = expectation(description: "A no turno")
+        let aAnswered = expectation(description: "turno de A respondeu")
+
+        queue.enqueue(id: UUID()) { turn in
+            aInTurn.fulfill()
+            log.events.append("turno de A: \(await turn())")
+            aAnswered.fulfill()
+        }
+
+        await fulfillment(of: [aInTurn], timeout: 2)
+        queue.cancelAll()
+        queue.isDeliveryHeld = false
+        await fulfillment(of: [aAnswered], timeout: 2)
+        XCTAssertEqual(log.events, ["turno de A: false"])
+    }
+
     func testCancelAllDiscardsWaitingAndFailsPendingTurns() async {
         let queue = RecordingJobQueue()
         queue.isDeliveryHeld = true

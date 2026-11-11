@@ -111,7 +111,7 @@ Cada gravação, ao parar, vira um item que carrega tudo o que hoje vive em prop
 ### Painel e Esc
 
 - O painel só some quando a fila esvazia e não há gravação viva, ou por cancelamento.
-- Esc duplo **com** gravação viva: cancela só a gravação viva, como hoje. Se houver fila, o painel continua visível mostrando o processamento; um segundo Esc duplo cancela a fila.
+- Esc duplo **com** gravação viva: cancela a gravação viva **e a fila toda**, sem colar nada, e o painel some (decisão do user em 11/11/2026). A regra anterior, que cancelava só a gravação viva, colava o item pronto 0,25 s depois do Esc: ele estava retido só pela gravação viva, e não dava tempo de um segundo Esc duplo.
 - Esc duplo **sem** gravação viva: cancela a fila toda (decisão do user).
 
 ### App de origem por item

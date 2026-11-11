@@ -848,6 +848,14 @@ class VoiceInkEngine: NSObject, ObservableObject {
 
     // MARK: - Cancellation
 
+    /// Esc duplo e atalho de cancelar: descarta a gravação viva e a fila toda, sem colar nada.
+    func cancelEverything() async {
+        // A fila primeiro: cancelar a gravação viva derruba `isDeliveryHeld`, e o item
+        // pronto que esperava a vez colaria antes do `cancelAll` (11/11/2026).
+        jobQueue.cancelAll()
+        await cancelRecording()
+    }
+
     /// Com gravação viva, cancela só ela. Sem gravação viva, cancela a fila toda.
     func cancelRecording() async {
         if isStoppingLiveRecording {

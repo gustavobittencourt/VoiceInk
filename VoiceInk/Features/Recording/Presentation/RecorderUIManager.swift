@@ -329,6 +329,13 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
         await dismissRecorderPanel()
     }
 
+    /// Esc duplo e atalho de cancelar: descarta a gravação viva e a fila toda.
+    func cancelEverything() async {
+        guard let engine = engine else { return }
+        await engine.cancelEverything()
+        await dismissRecorderPanel()
+    }
+
     // MARK: - Notification Handling
 
     private func setupNotifications() {

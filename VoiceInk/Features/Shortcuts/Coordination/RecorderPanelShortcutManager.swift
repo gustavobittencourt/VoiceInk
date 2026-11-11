@@ -170,7 +170,7 @@ final class RecorderPanelShortcutManager: ObservableObject {
                 return
             }
             ShortcutDiagnostics.notice("panel action=cancelRecorder result=cancel-requested")
-            await recorderUIManager.cancelRecording()
+            await recorderUIManager.cancelEverything()
         case .recorderPanelEscape:
             await handleEscapeShortcut()
         case .recorderPanelReturn:
@@ -199,7 +199,7 @@ final class RecorderPanelShortcutManager: ObservableObject {
         {
             ShortcutDiagnostics.notice("panel action=recorderPanelEscape result=cancel-confirmed")
             resetEscapeState()
-            await recorderUIManager.cancelRecording()
+            await recorderUIManager.cancelEverything()
             return
         }
 
