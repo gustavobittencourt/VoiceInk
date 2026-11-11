@@ -43,6 +43,10 @@ let cases: [(String, String, String)] = [
     ("preserve final punctuation", "Sim! sim? sim… sim;", "Sim;"),
     ("preserve word boundaries", "casa casas casa casas", "casa casas casa casas"),
     ("separator is not punctuation", "sim: sim: sim: sim", "sim: sim: sim: sim"),
+    ("identifier prefix", "prefixo_sim sim sim sim", "prefixo_sim sim sim sim"),
+    ("identifier suffix", "sim sim sim sim_sufixo", "sim sim sim sim_sufixo"),
+    ("canonical accents", "não na\u{0303}o não na\u{0303}o", "não"),
+    ("canonical accents preserve first", "na\u{0303}o não na\u{0303}o não", "na\u{0303}o"),
 ]
 var failures = 0
 for (name, input, expected) in cases {

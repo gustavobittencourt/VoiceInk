@@ -41,12 +41,17 @@ struct TranscriptionOutputFilter {
 
     private static func collapseInvoluntaryRepetitions(_ text: String) -> String {
         let word = #"[\p{L}\p{M}\p{N}]"#
+        // `_` encosta na palavra: `prefixo_sim sim sim sim` é identificador, não repetição.
+        let boundary = #"[\p{L}\p{M}\p{N}_]"#
         let separator = #"[\s,.;!?…]+"#
         let patterns = [
-            (#"(?<!"# + word + #")(que)(?:"# + separator + #"\1){2,}(?!"# + word + #")"#, "$1 que"),
-            (#"(?<!"# + word + #")("# + word + #"+)(?:"# + separator + #"\1){3,}(?!"# + word + #")"#, "$1"),
+            (#"(?<!"# + boundary + #")(que)(?:"# + separator + #"\1){2,}(?!"# + boundary + #")"#, "$1 que"),
+            (#"(?<!"# + boundary + #")("# + word + #"+)(?:"# + separator + #"\1){3,}(?!"# + boundary + #")"#, "$1"),
         ]
-        return patterns.reduce(text) { current, item in
+        // A retrorreferência do ICU compara unidades UTF-16: `não` composto e decomposto
+        // só casam depois da forma canônica.
+        let canonical = text.precomposedStringWithCanonicalMapping
+        return patterns.reduce(canonical) { current, item in
             guard let regex = try? NSRegularExpression(pattern: item.0, options: .caseInsensitive) else { return current }
             return regex.stringByReplacingMatches(
                 in: current, range: NSRange(current.startIndex..., in: current), withTemplate: item.1)
